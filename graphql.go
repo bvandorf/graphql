@@ -1,33 +1,34 @@
 // Package graphql provides a low level GraphQL client.
 //
-//  // create a client (safe to share across requests)
-//  client := graphql.NewClient("https://machinebox.io/graphql")
+//	// create a client (safe to share across requests)
+//	client := graphql.NewClient("https://machinebox.io/graphql")
 //
-//  // make a request
-//  req := graphql.NewRequest(`
-//      query ($key: String!) {
-//          items (id:$key) {
-//              field1
-//              field2
-//              field3
-//          }
-//      }
-//  `)
+//	// make a request
+//	req := graphql.NewRequest(`
+//	    query ($key: String!) {
+//	        items (id:$key) {
+//	            field1
+//	            field2
+//	            field3
+//	        }
+//	    }
+//	`)
 //
-//  // set any variables
-//  req.Var("key", "value")
+//	// set any variables
+//	req.Var("key", "value")
 //
-//  // run it and capture the response
-//  var respData ResponseStruct
-//  if err := client.Run(ctx, req, &respData); err != nil {
-//      log.Fatal(err)
-//  }
+//	// run it and capture the response
+//	var respData ResponseStruct
+//	if err := client.Run(ctx, req, &respData); err != nil {
+//	    log.Fatal(err)
+//	}
 //
-// Specify client
+// # Specify client
 //
 // To specify your own http.Client, use the WithHTTPClient option:
-//  httpclient := &http.Client{}
-//  client := graphql.NewClient("https://machinebox.io/graphql", graphql.WithHTTPClient(httpclient))
+//
+//	httpclient := &http.Client{}
+//	client := graphql.NewClient("https://machinebox.io/graphql", graphql.WithHTTPClient(httpclient))
 package graphql
 
 import (
@@ -38,6 +39,7 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"reflect"
 
 	"github.com/pkg/errors"
 )
@@ -47,9 +49,6 @@ type Client struct {
 	endpoint         string
 	httpClient       *http.Client
 	useMultipartForm bool
-
-	// closeReq will close the request body immediately allowing for reuse of client
-	closeReq bool
 
 	// Log is called with various debug information.
 	// To log to standard out, use:
@@ -82,12 +81,19 @@ func (c *Client) logf(format string, args ...interface{}) {
 // If the request fails or the server returns an error, the first error
 // will be returned.
 func (c *Client) Run(ctx context.Context, req *Request, resp interface{}) error {
+	value := reflect.ValueOf(resp)
+	if value.Kind() != reflect.Ptr {
+		c.logf("<< error: response is not a pointer")
+		return errors.New("response is not a pointer")
+	}
 	select {
 	case <-ctx.Done():
+		c.logf("<< context done: %s", ctx.Err())
 		return ctx.Err()
 	default:
 	}
 	if len(req.files) > 0 && !c.useMultipartForm {
+		c.logf("<< error: cannot send files with PostFields option")
 		return errors.New("cannot send files with PostFields option")
 	}
 	if c.useMultipartForm {
@@ -106,6 +112,7 @@ func (c *Client) runWithJSON(ctx context.Context, req *Request, resp interface{}
 		Variables: req.vars,
 	}
 	if err := json.NewEncoder(&requestBody).Encode(requestBodyObj); err != nil {
+		c.logf("<< error encoding body: %s", err)
 		return errors.Wrap(err, "encode body")
 	}
 	c.logf(">> variables: %v", req.vars)
@@ -115,9 +122,9 @@ func (c *Client) runWithJSON(ctx context.Context, req *Request, resp interface{}
 	}
 	r, err := http.NewRequest(http.MethodPost, c.endpoint, &requestBody)
 	if err != nil {
+		c.logf("<< error: %s", err)
 		return err
 	}
-	r.Close = c.closeReq
 	r.Header.Set("Content-Type", "application/json; charset=utf-8")
 	r.Header.Set("Accept", "application/json; charset=utf-8")
 	for key, values := range req.Header {
@@ -129,24 +136,29 @@ func (c *Client) runWithJSON(ctx context.Context, req *Request, resp interface{}
 	r = r.WithContext(ctx)
 	res, err := c.httpClient.Do(r)
 	if err != nil {
+		c.logf("<< error: %s", err)
 		return err
 	}
 	defer res.Body.Close()
 	var buf bytes.Buffer
 	if _, err := io.Copy(&buf, res.Body); err != nil {
+		c.logf("<< error reading body: %s", err)
 		return errors.Wrap(err, "reading body")
 	}
 	c.logf("<< %s", buf.String())
 	if err := json.NewDecoder(&buf).Decode(&gr); err != nil {
-		if res.StatusCode != http.StatusOK {
-			return fmt.Errorf("graphql: server returned a non-200 status code: %v", res.StatusCode)
-		}
+		c.logf("<< error decoding response: %s", err)
 		return errors.Wrap(err, "decoding response")
 	}
+	c.logf("<< response: %+v", gr)
 	if len(gr.Errors) > 0 {
+		for _, err := range gr.Errors {
+			c.logf("<< graph error: %s", err.Message)
+		}
 		// return first error
 		return gr.Errors[0]
 	}
+	c.logf("<< Returning nil")
 	return nil
 }
 
@@ -154,28 +166,34 @@ func (c *Client) runWithPostFields(ctx context.Context, req *Request, resp inter
 	var requestBody bytes.Buffer
 	writer := multipart.NewWriter(&requestBody)
 	if err := writer.WriteField("query", req.q); err != nil {
+		c.logf("<< error writing query field: %s", err)
 		return errors.Wrap(err, "write query field")
 	}
 	var variablesBuf bytes.Buffer
 	if len(req.vars) > 0 {
 		variablesField, err := writer.CreateFormField("variables")
 		if err != nil {
+			c.logf("<< error creating variables field: %s", err)
 			return errors.Wrap(err, "create variables field")
 		}
 		if err := json.NewEncoder(io.MultiWriter(variablesField, &variablesBuf)).Encode(req.vars); err != nil {
+			c.logf("<< error encoding variables: %s", err)
 			return errors.Wrap(err, "encode variables")
 		}
 	}
 	for i := range req.files {
 		part, err := writer.CreateFormFile(req.files[i].Field, req.files[i].Name)
 		if err != nil {
+			c.logf("<< error creating form file: %s", err)
 			return errors.Wrap(err, "create form file")
 		}
 		if _, err := io.Copy(part, req.files[i].R); err != nil {
+			c.logf("<< error preparing file: %s", err)
 			return errors.Wrap(err, "preparing file")
 		}
 	}
 	if err := writer.Close(); err != nil {
+		c.logf("<< error closing writer: %s", err)
 		return errors.Wrap(err, "close writer")
 	}
 	c.logf(">> variables: %s", variablesBuf.String())
@@ -186,9 +204,9 @@ func (c *Client) runWithPostFields(ctx context.Context, req *Request, resp inter
 	}
 	r, err := http.NewRequest(http.MethodPost, c.endpoint, &requestBody)
 	if err != nil {
+		c.logf("<< error: %s", err)
 		return err
 	}
-	r.Close = c.closeReq
 	r.Header.Set("Content-Type", writer.FormDataContentType())
 	r.Header.Set("Accept", "application/json; charset=utf-8")
 	for key, values := range req.Header {
@@ -200,24 +218,28 @@ func (c *Client) runWithPostFields(ctx context.Context, req *Request, resp inter
 	r = r.WithContext(ctx)
 	res, err := c.httpClient.Do(r)
 	if err != nil {
+		c.logf("<< error: %s", err)
 		return err
 	}
 	defer res.Body.Close()
 	var buf bytes.Buffer
 	if _, err := io.Copy(&buf, res.Body); err != nil {
+		c.logf("<< error reading body: %s", err)
 		return errors.Wrap(err, "reading body")
 	}
 	c.logf("<< %s", buf.String())
 	if err := json.NewDecoder(&buf).Decode(&gr); err != nil {
-		if res.StatusCode != http.StatusOK {
-			return fmt.Errorf("graphql: server returned a non-200 status code: %v", res.StatusCode)
-		}
+		c.logf("<< error decoding response: %s", err)
 		return errors.Wrap(err, "decoding response")
 	}
 	if len(gr.Errors) > 0 {
+		for _, err := range gr.Errors {
+			c.logf("<< graph error: %s", err.Message)
+		}
 		// return first error
 		return gr.Errors[0]
 	}
+	c.logf("<< Returning nil")
 	return nil
 }
 
@@ -235,13 +257,6 @@ func WithHTTPClient(httpclient *http.Client) ClientOption {
 func UseMultipartForm() ClientOption {
 	return func(client *Client) {
 		client.useMultipartForm = true
-	}
-}
-
-//ImmediatelyCloseReqBody will close the req body immediately after each request body is ready
-func ImmediatelyCloseReqBody() ClientOption {
-	return func(client *Client) {
-		client.closeReq = true
 	}
 }
 
@@ -266,7 +281,7 @@ type graphResponse struct {
 type Request struct {
 	q     string
 	vars  map[string]interface{}
-	files []File
+	files []file
 
 	// Header represent any request headers that will be set
 	// when the request is made.
@@ -290,34 +305,19 @@ func (req *Request) Var(key string, value interface{}) {
 	req.vars[key] = value
 }
 
-// Vars gets the variables for this Request.
-func (req *Request) Vars() map[string]interface{} {
-	return req.vars
-}
-
-// Files gets the files in this request.
-func (req *Request) Files() []File {
-	return req.files
-}
-
-// Query gets the query string of this request.
-func (req *Request) Query() string {
-	return req.q
-}
-
 // File sets a file to upload.
 // Files are only supported with a Client that was created with
 // the UseMultipartForm option.
 func (req *Request) File(fieldname, filename string, r io.Reader) {
-	req.files = append(req.files, File{
+	req.files = append(req.files, file{
 		Field: fieldname,
 		Name:  filename,
 		R:     r,
 	})
 }
 
-// File represents a file to upload.
-type File struct {
+// file represents a file to upload.
+type file struct {
 	Field string
 	Name  string
 	R     io.Reader
